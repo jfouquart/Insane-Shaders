@@ -65,11 +65,6 @@ Ported to ReShade by: Lord Of Lunacy
 	#define CENTER_OFFSET float2(0.0, 0.0)
 #endif
 
-//Not currently supported by the code, as it did not improve performance, but kept incase this functionality is added back
-//in the future
-#define CMAA_PACK_SINGLE_SAMPLE_EDGE_TO_HALF_WIDTH  0   // adds more ALU but reduces memory use for edges by half by packing two 4 bit edge info into one R8_UINT texel - helps on all HW except at really low res
-
-
 #define DIVIDE_ROUNDING_UP(a, b) (((a) + (b) - 1) / (b))
 
 #if SUPPORTED
@@ -79,7 +74,14 @@ Ported to ReShade by: Lord Of Lunacy
 //
 // Longest line search distance; must be even number; for high perf low quality start from ~32 - the bigger the number,
 // the nicer the gradients but more costly. Max supported is 128!
-static const uint c_maxLineLength = 128;
+//static const uint c_maxLineLength = 128;
+uniform uint c_maxLineLength <
+	ui_type = "slider";
+	ui_min = 8; ui_max = 128;
+	ui_label = "Longest line search distance";
+	ui_tooltip = "The bigger the number, the nicer the gradients but more costly.";
+> = 128;
+
 //
 #ifndef CMAA2_EXTRA_SHARPNESS
 	#define CMAA2_EXTRA_SHARPNESS                   0     // Set to 1 to preserve even more text and shape clarity at the expense of less AA
@@ -102,6 +104,11 @@ static const uint c_maxLineLength = 128;
 
 #ifndef CMAA2_MLAA_EDGE_DETECTION
 	#define CMAA2_MLAA_EDGE_DETECTION 0
+#endif
+
+// adds more ALU but reduces memory use for edges by half by packing two 4 bit edge info into one R8_UINT texel - helps on all HW except at really low res
+#ifndef CMAA_PACK_SINGLE_SAMPLE_EDGE_TO_HALF_WIDTH
+	#define CMAA_PACK_SINGLE_SAMPLE_EDGE_TO_HALF_WIDTH 0
 #endif
 
 // presets (for HDR color buffer maybe use higher values)
@@ -174,12 +181,20 @@ namespace CMAA_2
 {
 texture2D ZShapes <pooled = true;>{Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RGBA8;};
 texture2D BackBuffer : COLOR;
+#if CMAA_PACK_SINGLE_SAMPLE_EDGE_TO_HALF_WIDTH
+texture2D HalfWidthEdges <pooled = true;>{Width = (BUFFER_WIDTH + 1) / 2; Height = BUFFER_HEIGHT; Format = R8;};
+#else
 texture2D Edges <pooled = true;>{Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R8;};
+#endif
 texture2D ProcessedCandidates <pooled = true;>{Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RGBA16f;};
 
 sampler2D sZShapes {Texture = ZShapes;};
 sampler2D sBackBuffer {Texture = BackBuffer;};
+#if CMAA_PACK_SINGLE_SAMPLE_EDGE_TO_HALF_WIDTH
+sampler2D sEdges {Texture = HalfWidthEdges;};
+#else
 sampler2D sEdges {Texture = Edges;};
+#endif
 sampler2D sProcessedCandidates{Texture = ProcessedCandidates;};
 
 #if !COMPUTE
@@ -236,12 +251,9 @@ storage wProcessedCandidates {Texture = ProcessedCandidates;};
 //              |_________|
 //                   G - 0x02
 
-//Due to reshade only supporting unorms, the return type is a float
-//Also add an isCandidate check to support performing the histogram style formation of the linked list of candidates
-//Hopefully this won't always be neccessary and ReShade will get support for atomic operations on textures to do it properly
-float PackEdges( float4 edges, bool isCandidate )   // input edges are binary 0 or 1
+uint PackEdges( float4 edges )   // input edges are binary 0 or 1
 {
-	return (dot( edges, float4( 1, 2, 4, 8 )) + 16 * isCandidate)  / 255;
+	return dot( edges, float4( 1, 2, 4, 8 ));
 }
 
 uint4 UnpackEdges( uint value )
@@ -269,22 +281,22 @@ float4 UnpackEdgesFlt( uint value )
 float4 packZ(bool horizontal, bool invertedZ, float shapeQualityScore, float lineLengthLeft, float lineLengthRight)
 {
 	//return //(uint(horizontal) << 19) | (uint(invertedZ) << 18) | (uint(shapeQualityScore) << 16) | (uint(lineLengthLeft) << 8) | (uint(lineLengthRight));
-	float4 temp = float4(
+	const float4 temp = float4(
 		lineLengthLeft,
 		lineLengthRight,
 		shapeQualityScore,
 		horizontal * 2 + invertedZ + 4);//The plus 4 helps with the compute
-	return temp / 255;
+	return temp / 255.0f;
 }
 
 void unpackZ(float4 packedZ, out bool horizontal, out bool invertedZ, out float shapeQualityScore, out float lineLengthLeft, out float lineLengthRight)
 {
-	uint4 temp = packedZ * 255.5;
+	const uint4 temp = mad(packedZ, 255.0, 0.5);
 	horizontal = temp.w / 2 % 2;
 	invertedZ = temp.w % 2;
 	shapeQualityScore = temp.z;
-	lineLengthLeft = temp.x;
 	lineLengthRight = temp.y;
+	lineLengthLeft = temp.x;
 }
 
 #if COMPUTE
@@ -298,7 +310,7 @@ float2 packSum(uint value)
 
 uint unpackSum(float2 value)
 {
-	uint2 temp = value * 255.5;
+	const uint2 temp = mad(value, 255.0, 0.5);
 	return ((temp.x << 8) | temp.y);
 }
 #endif
@@ -309,7 +321,7 @@ uint unpackSum(float2 value)
 
 float3 LoadSourceColor( uint2 pixelPos )
 {
-	float3 color = tex2Dfetch(sBackBuffer, pixelPos).rgb;
+	const float3 color = tex2Dfetch(sBackBuffer, pixelPos).rgb;
 	return color;
 }
 
@@ -323,17 +335,17 @@ float3 LoadSourceColor( uint2 pixelPos, int2 offset )
 // Edge detection and local contrast adaptation helpers
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //
+static const float3 LumWeights = float3( 0.299, 0.587, 0.114 );
 float EdgeDetectColorCalcDiff( float3 colorA, float3 colorB )
 {
-	const float3 LumWeights = float3( 0.299, 0.587, 0.114 );
-	float3 diff = abs( (colorA.rgb - colorB.rgb) );
-	return dot( diff.rgb, LumWeights.rgb );
+	const float3 diff = abs( colorA - colorB );
+	return dot( diff, LumWeights );
 }
 
 //In the pixel shader all 4 edges need to be computed locally
 float4 PSComputeEdge(float3 pixelColor,float3 pixelColorRight,float3 pixelColorBottom, float3 pixelColorLeft, float3 pixelColorTop)
 {
-	float4 temp = float4(
+	const float4 temp = float4(
 		EdgeDetectColorCalcDiff(pixelColor, pixelColorRight),
 		EdgeDetectColorCalcDiff(pixelColor, pixelColorBottom),
 		EdgeDetectColorCalcDiff(pixelColor, pixelColorLeft),
@@ -407,34 +419,32 @@ float4 ComputeSimpleShapeBlendValues( float4 edges, float4 edgesLeft, float4 edg
 	return float4( fromLeft, fromAbove, fromRight, fromBelow ) * blurCoeff;
 }
 
+uint FetchEdge(int2 pixelPos)
+{
+	return uint(mad(tex2Dfetch(sEdges, pixelPos).x, 255.0, 0.5));
+}
+
 uint LoadEdge(int2 pixelPos)
 {
-	uint edge   = uint(tex2Dfetch(sEdges, pixelPos).x * 255.5);
+#if CMAA_PACK_SINGLE_SAMPLE_EDGE_TO_HALF_WIDTH
+	const uint edge = FetchEdge( int2(pixelPos.x / 2, pixelPos.y) );
+	const int  oddX = pixelPos.x % 2;
+#if D3D9
+	return (edge / mad(oddX, 15, 1)) % 16;
+#else
+	return (edge >> (oddX*4)) & 0xF;
+#endif
+#else
+	const uint edge = FetchEdge( pixelPos );
 	return edge;
+#endif
 }
 
 uint LoadEdge(int2 pixelPos, int2 offset)
 {
-	return LoadEdge(pixelPos + offset);
+	return LoadEdge( pixelPos + offset );
 }
 
-// tex2Dgather: w = 0,0
-// +---+---+
-// | w | z |
-// +---+---+
-// | x | y |
-// +---+---+
-uint4 GatherEdge(float2 texcoord)
-{
-	uint4 edges = uint4(tex2DgatherR(sEdges, texcoord) * 255.5);
-	return edges;
-}
-
-uint4 GatherEdge(float2 texcoord, int2 offset)
-{
-	uint4 edges = uint4(tex2DgatherR(sEdges, texcoord, offset) * 255.5);
-	return edges;
-}
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -462,9 +472,8 @@ void PostProcessVS(in uint id : SV_VertexID, out float4 position : SV_Position, 
  */
 static const float g_CMAA2_MLAAMaxLumaSurround = 0.5;
 
-void EdgesPS(float4 position : SV_Position, float2 texcoord : TEXCOORD, out float output : SV_TARGET0)
+uint ComputeEdges(int2 coord)
 {
-	int2 coord = position.xy;
 	float3 a = tex2Dfetch(sBackBuffer, coord + int2(-1, -1)).rgb;
 	float3 b = tex2Dfetch(sBackBuffer, coord + int2( 0, -1)).rgb;
 	float3 c = tex2Dfetch(sBackBuffer, coord + int2( 1, -1)).rgb;
@@ -507,19 +516,38 @@ void EdgesPS(float4 position : SV_Position, float2 texcoord : TEXCOORD, out floa
 	//Use a ternary operator to evaluate each vector component individually
 	edges = (edges > g_CMAA2_EdgeThreshold) ? float4(1, 1, 1, 1) : float4(0, 0, 0, 0);
 
-	// if there's at least one two edge corner, this is a candidate for simple or complex shape processing...
-	bool isCandidate = ( edges.x * edges.y + edges.y * edges.z + edges.z * edges.w + edges.w * edges.x ) != 0;
-
-	output = PackEdges(edges, isCandidate);
+	return PackEdges(edges);
 	//if(output < 1/256) discard;
 }
 
+void EdgesPS(float4 position : SV_Position, float2 texcoord : TEXCOORD, out float output : SV_TARGET0)
+{
+#if CMAA_PACK_SINGLE_SAMPLE_EDGE_TO_HALF_WIDTH
+	const int2 coord = int2(position.x * 2, position.y);
+#if D3D9
+	const uint edges = mad( ComputeEdges(coord + int2(1, 0)), 16.0, ComputeEdges(coord) );
+#else
+	const uint edges = ComputeEdges(coord + int2(1, 0)) << 4 | ComputeEdges(coord);
+#endif
+#else
+	const int2 coord = position.xy;
+	const uint edges = ComputeEdges(coord);
+#endif
+	//Due to reshade only supporting unorms, the return type is a float
+	output = edges / 255.0f;
+}
+
+// idx = mad(horizontal, 2, invertedZShape)
+static const uint4x4 edgeMask = uint4x4(
+	// maskTraceRight, maskStopRight, maskTraceLeft, maskStopLeft
+	uint4( 0x01, 0x02, 0x04, 0x08 ),
+	uint4( 0x04, 0x02, 0x01, 0x08 ),
+	uint4( 0x02, 0x04, 0x08, 0x01 ),
+	uint4( 0x08, 0x04, 0x02, 0x01 ));
 void FindZLineLengths( out float lineLengthLeft, out float lineLengthRight, uint2 screenPos, bool horizontal, bool invertedZShape, const float2 stepRight)
 {
 // this enables additional conservativeness test but is pretty detrimental to the final effect so left disabled by default even when CMAA2_EXTRA_SHARPNESS is enabled
 #define CMAA2_EXTRA_CONSERVATIVENESS2 0
-	/////////////////////////////////////////////////////////////////////////////////////////////////////////
-	// TODO: a cleaner and faster way to get to these - a precalculated array indexing maybe?
 	uint maskLeft, bitsContinueLeft, maskRight, bitsContinueRight;
 	{
 		// Horizontal (vertical is the same, just rotated 90- counter-clockwise)
@@ -527,42 +555,13 @@ void FindZLineLengths( out float lineLengthLeft, out float lineLengthRight, uint
 		//   __                          // __
 		//  X|                           //  X|
 		// --                            //   --
-		uint maskTraceLeft, maskTraceRight;
+		const uint maskIdx = mad(horizontal, 2, invertedZShape);
+		maskLeft  = bitsContinueLeft  = edgeMask[maskIdx].z;
+		maskRight = bitsContinueRight = edgeMask[maskIdx].x;
 #if CMAA2_EXTRA_CONSERVATIVENESS2
-		uint maskStopLeft, maskStopRight;
+		maskLeft  |= edgeMask[maskIdx].w;
+		maskRight |= edgeMask[maskIdx].y;
 #endif
-		if( horizontal )
-		{
-			maskTraceLeft = 0x08; // tracing top edge
-			maskTraceRight = 0x02; // tracing bottom edge
-#if CMAA2_EXTRA_CONSERVATIVENESS2
-			maskStopLeft = 0x01; // stop on right edge
-			maskStopRight = 0x04; // stop on left edge
-#endif
-		}
-		else
-		{
-			maskTraceLeft = 0x04; // tracing left edge
-			maskTraceRight = 0x01; // tracing right edge
-#if CMAA2_EXTRA_CONSERVATIVENESS2
-			maskStopLeft = 0x08; // stop on top edge
-			maskStopRight = 0x02; // stop on bottom edge
-#endif
-		}
-		if( invertedZShape )
-		{
-			uint temp = maskTraceLeft;
-			maskTraceLeft = maskTraceRight;
-			maskTraceRight = temp;
-		}
-		maskLeft = maskTraceLeft;
-		bitsContinueLeft = maskTraceLeft;
-		maskRight = maskTraceRight;
-#if CMAA2_EXTRA_CONSERVATIVENESS2
-		maskLeft |= maskStopLeft;
-		maskRight |= maskStopRight;
-#endif
-		bitsContinueRight = maskTraceRight;
 	}
 	/////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -579,11 +578,11 @@ void FindZLineLengths( out float lineLengthLeft, out float lineLengthRight, uint
 
 		// stop on encountering 'stopping' edge (as defined by masks)
 #if D3D9
-		continueLeft   = continueLeft  && (edgeLeft / maskLeft % 2);
-		continueRight  = continueRight && (edgeRight / maskRight % 2);
+		continueLeft  = continueLeft  && ( edgeLeft  / maskLeft  % 2 );
+		continueRight = continueRight && ( edgeRight / maskRight % 2 );
 #else
-		continueLeft   = continueLeft  && ( edgeLeft & maskLeft );
-		continueRight  = continueRight && ( edgeRight & maskRight );
+		continueLeft  = continueLeft  && ( edgeLeft  & maskLeft  );
+		continueRight = continueRight && ( edgeRight & maskRight );
 #endif
 
 		lineLengthLeft  += continueLeft;
@@ -625,34 +624,26 @@ void DetectZsHorizontal( in float4 edges, in float4 edgesM1P0, in float4 edgesP1
 	}
 }
 
-float4 BlendSimpleShape(uint2 coord, float4 edges, float4 edgesLeft, float4 edgesRight, float4 edgesBottom, float4 edgesTop)
+float4 BlendSimpleShape(uint2 coord, float4 blendVal)
 {
-	float4 blendVal = ComputeSimpleShapeBlendValues(edges, edgesLeft, edgesRight, edgesTop, edgesBottom, true);
-
 	const float fourWeightSum = dot(blendVal, 1);
 	const float centerWeight = 1 - fourWeightSum;
 
-	float3 outColor = LoadSourceColor(coord, int2(0, 0)).rgb * centerWeight;
-
-	float3 pixel;
+	float3 outColor = LoadSourceColor(coord) * centerWeight;
 
 	//left
-	pixel = LoadSourceColor(coord, int2(-1, 0)).rgb;
-	outColor.rgb += (blendVal.x > 0) ? blendVal.x * pixel : 0;
+	outColor += (blendVal.x > 0) ? blendVal.x * LoadSourceColor(coord, int2(-1,  0)) : 0;
 
 	//above
-	pixel = LoadSourceColor(coord, int2(0, -1)).rgb;
-	outColor.rgb += (blendVal.y > 0) ? blendVal.y * pixel : 0;
+	outColor += (blendVal.y > 0) ? blendVal.y * LoadSourceColor(coord, int2( 0, -1)) : 0;
 
 	//right
-	pixel = LoadSourceColor(coord, int2(1, 0)).rgb;
-	outColor.rgb += (blendVal.z > 0) ? blendVal.z * pixel : 0;
+	outColor += (blendVal.z > 0) ? blendVal.z * LoadSourceColor(coord, int2( 1,  0)) : 0;
 
 	//below
-	pixel = LoadSourceColor(coord, int2(0, 1)).rgb;
-	outColor.rgb += (blendVal.w > 0) ? blendVal.w * pixel : 0;
+	outColor += (blendVal.w > 0) ? blendVal.w * LoadSourceColor(coord, int2( 0,  1)) : 0;
 
-	return float4(outColor.rgb, 1);
+	return float4(outColor, 1);
 }
 
 float4 DetectComplexShapes(uint2 coord, float4 edges, float4 edgesLeft, float4 edgesRight, float4 edgesBottom, float4 edgesTop)
@@ -730,39 +721,6 @@ float4 DetectComplexShapes(uint2 coord, float4 edges, float4 edgesLeft, float4 e
 }
 
 #if !COMPUTE
-	float4 BlendSimpleShape(uint2 coord, uint edges, uint edgesLeft, uint edgesRight, uint edgesBottom, uint edgesTop)
-	{
-		uint2 blendValPos = uint2(
-			dot(uint2(16, 1), uint2(             edges           ,   edgesTop % 2 +   edgesLeft / 2)),
-			dot(uint2(16, 1), uint2(edgesRight % 4 + edgesTop / 4, edgesRight / 8 + edgesBottom % 8)));
-		float4 blendVal = tex2Dfetch(sSimpleShapeBlendVal, blendValPos);
-
-		const float fourWeightSum = dot(blendVal, 1);
-		const float centerWeight = 1 - fourWeightSum;
-
-		float3 outColor = LoadSourceColor(coord).rgb * centerWeight;
-
-		float3 pixel;
-
-		//left
-		pixel = LoadSourceColor(coord, int2(-1, 0)).rgb;
-		outColor.rgb += blendVal.x * pixel;
-
-		//above
-		pixel = LoadSourceColor(coord, int2(0, -1)).rgb;
-		outColor.rgb += blendVal.y * pixel;
-
-		//right
-		pixel = LoadSourceColor(coord, int2(1, 0)).rgb;
-		outColor.rgb += blendVal.z * pixel;
-
-		//below
-		pixel = LoadSourceColor(coord, int2(0, 1)).rgb;
-		outColor.rgb += blendVal.w * pixel;
-
-		return float4(outColor.rgb, 1);
-	}
-
 	float4 DetectComplexShapes(uint2 coord, uint edges, uint edgesLeft, uint edgesRight, uint edgesBottom, uint edgesTop)
 	{
 		float4 scores;
@@ -771,8 +729,8 @@ float4 DetectComplexShapes(uint2 coord, float4 edges, float4 edgesLeft, float4 e
 		// horizontal
 		{
 			uint2 horzPos = uint2(
-				dot(uint2(16, 1), uint2(edges, edgesLeft)),
-				dot(uint2(16, 1), uint2(edgesRight, LoadEdge(coord, int2( 2, 0 )) % 16)));
+				mad(      edges, 16,                     edgesLeft ),
+				mad( edgesRight, 16, LoadEdge(coord, int2( 2, 0 )) ));
 			scores.xy = tex2Dfetch(sZShapeScores, horzPos).xy;
 		}
 		/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -781,69 +739,60 @@ float4 DetectComplexShapes(uint2 coord, float4 edges, float4 edgesLeft, float4 e
 		// vertical
 		{
 			uint2 vertPos = uint2(
-				dot(uint2(16, 1), uint2(edges, edgesBottom)),
-				dot(uint2(16, 1), uint2(edgesTop, LoadEdge(coord, int2( 0, -2 )) % 16)));
+				mad(    edges, 16,                    edgesBottom ),
+				mad( edgesTop, 16, LoadEdge(coord, int2( 0, -2 )) ));
 			scores.zw = tex2Dfetch(sZShapeScores, vertPos).zw;
 		}
 		/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-		float maxScore;
-		bool  invertedZ;
-		bool  horizontal = scores.x > scores.z;
+		const bool  horizontal = scores.x > scores.z;
+		const float maxScore   = 4.0 * lerp(scores.z, scores.x, horizontal);
 
-		if( horizontal )
-		{
-			maxScore   = scores.x * 4.0;
-			invertedZ  = scores.y != 0.0;
-		}
-		else
-		{
-			maxScore   = scores.z * 4.0;
-			invertedZ  = scores.w != 0.0;
-		}
+		if( maxScore <= 0.0 )
+			return 0;
 
-		if( maxScore > 0 )
-		{
 	#if CMAA2_EXTRA_SHARPNESS
-			float shapeQualityScore = round( clamp(4.0 - maxScore, 0.0, 3.0) );    // 0 - best quality, 1 - some edges missing but ok, 2 & 3 - dubious but better than nothing
+		const float shapeQualityScore = round( clamp(4.0 - maxScore, 0.0, 3.0) );    // 0 - best quality, 1 - some edges missing but ok, 2 & 3 - dubious but better than nothing
 	#else
-			float shapeQualityScore = floor( clamp(4.0 - maxScore, 0.0, 3.0) );    // 0 - best quality, 1 - some edges missing but ok, 2 & 3 - dubious but better than nothing
+		const float shapeQualityScore = floor( clamp(4.0 - maxScore, 0.0, 3.0) );    // 0 - best quality, 1 - some edges missing but ok, 2 & 3 - dubious but better than nothing
 	#endif
 
-			const float2 stepRight = ( horizontal ) ? ( float2( 1, 0 ) ) : ( float2( 0, -1 ) );
-			float lineLengthLeft, lineLengthRight;
-			FindZLineLengths( lineLengthLeft, lineLengthRight, coord, horizontal, invertedZ, stepRight);
+		const float2 stepRight = ( horizontal ) ? ( float2( 1, 0 ) ) : ( float2( 0, -1 ) );
+		const bool   invertedZ = lerp(scores.w, scores.y, horizontal) != 0;
 
-			lineLengthLeft  -= shapeQualityScore;
-			lineLengthRight -= shapeQualityScore;
-			if( ( lineLengthLeft + lineLengthRight ) >= (5.0) )
-			{
-				return packZ(horizontal, invertedZ, shapeQualityScore, lineLengthLeft, lineLengthRight);//((uint(horizontal) << 19) | (uint(invertedZ) << 18) | (uint(shapeQualityScore) << 16) | (uint(lineLengthLeft) << 8) | (uint(lineLengthRight)));
-			}
-		}
-		return 0;
+		float lineLengthLeft, lineLengthRight;
+		FindZLineLengths( lineLengthLeft, lineLengthRight, coord, horizontal, invertedZ, stepRight);
+
+		lineLengthLeft  -= shapeQualityScore;
+		lineLengthRight -= shapeQualityScore;
+
+		if( lineLengthLeft + lineLengthRight < 5.0 )
+			return 0;
+
+		//((uint(horizontal) << 19) | (uint(invertedZ) << 18) | (uint(shapeQualityScore) << 16) | (uint(lineLengthLeft) << 8) | (uint(lineLengthRight)));
+		return packZ(horizontal, invertedZ, shapeQualityScore, lineLengthLeft, lineLengthRight);
 	}
 
 	void ProcessEdgesPS(float4 position : SV_Position, float2 texcoord : TEXCOORD, out float4 output : SV_TARGET0, out float4 ZShapes : SV_TARGET1)
 	{
-		int2 coord = position.xy;
-		uint4 edgesBottomRight = GatherEdge(texcoord);
+		const int2  coord       = position.xy;
+		const uint  edges       = LoadEdge(coord);
+		const uint4 unpackEdges = UnpackEdges(edges);
 
-		if(edgesBottomRight.w > 16)
-		{
-			uint4 edgesTopLeft = GatherEdge(texcoord, int2(-1, -1));
-
-			uint edges       = edgesBottomRight.w % 16;
-			uint edgesLeft   = edgesTopLeft.x     % 16;
-			uint edgesRight  = edgesBottomRight.z % 16;
-			uint edgesBottom = edgesBottomRight.x % 16;
-			uint edgesTop    = edgesTopLeft.z     % 16;
-			output = BlendSimpleShape(coord, edges, edgesLeft, edgesRight, edgesBottom, edgesTop);
-
-			ZShapes = DetectComplexShapes(coord, edges, edgesLeft, edgesRight, edgesBottom, edgesTop);
-		}
-		else
+		if( dot(unpackEdges.xyzw, unpackEdges.yzwx) == 0 )
 			discard;
+
+		// There's at least one two edge corner, this is a candidate for simple or complex shape processing...
+		const uint edgesLeft     = LoadEdge(coord, int2(-1,  0));
+		const uint edgesRight    = LoadEdge(coord, int2( 1,  0));
+		const uint edgesBottom   = LoadEdge(coord, int2( 0,  1));
+		const uint edgesTop      = LoadEdge(coord, int2( 0, -1));
+		const int2 blendValCoord = int2(
+			mad(                        edges , 16,   edgesTop % 2 +   edgesLeft / 2 ),
+			mad( edgesRight % 4 + edgesTop / 4, 16, edgesRight / 8 + edgesBottom % 8 ));
+		output = BlendSimpleShape(coord, tex2Dfetch(sSimpleShapeBlendVal, blendValCoord));
+
+		ZShapes = DetectComplexShapes(coord, edges, edgesLeft, edgesRight, edgesBottom, edgesTop);
 	}
 #else
 	groupshared uint g_count;
@@ -861,12 +810,15 @@ float4 DetectComplexShapes(uint2 coord, float4 edges, float4 edgesLeft, float4 e
 			for(uint j = 0; j < EDGE_PIXELS_PER_THREAD.y; j++)
 			{
 				uint center = LoadEdge(coord, int2(i, j));
+				uint4 unpackCenter = UnpackEdges(center);
+				//Add check to support performing the histogram style formation of the linked list of candidates
+				//Hopefully this won't always be neccessary and ReShade will get support for atomic operations on textures to do it properly
 				//Add edge to queue if it requires more processing
 				//This reorders the threads by compacting work items within warps
-				if(center > 16)
+				if( dot(unpackCenter.xyzw, unpackCenter.yzwx) != 0 )
 				{
 					uint workerId = atomicAdd(g_count, 1u);
-					g_work[workerId] =  (coord.x + i) << 18 | (coord.y + j) << 4 | (center & 0xF);// - (1u << 4);
+					g_work[workerId] =  (coord.x + i) << 18 | (coord.y + j) << 4 | center;// - (1u << 4);
 				}
 			}
 		}
@@ -886,7 +838,8 @@ float4 DetectComplexShapes(uint2 coord, float4 edges, float4 edgesLeft, float4 e
 			float4 edgesBottom = UnpackEdgesFlt(LoadEdge(coord, int2(0, 1)));
 			float4 edgesTop = UnpackEdgesFlt(LoadEdge(coord, int2(0, -1)));
 
-			tex2Dstore(wProcessedCandidates, coord, BlendSimpleShape(coord, edges, edgesLeft, edgesRight, edgesBottom, edgesTop));//float4(outColor.rgb, 1));
+			float4 blendVal = ComputeSimpleShapeBlendValues(edges, edgesLeft, edgesRight, edgesTop, edgesBottom, true);
+			tex2Dstore(wProcessedCandidates, coord, BlendSimpleShape(coord, blendVal));//float4(outColor.rgb, 1));
 
 			float4 complexShape = DetectComplexShapes(coord, edges, edgesLeft, edgesRight, edgesBottom, edgesTop);
 			if(any(complexShape > 0))
@@ -974,14 +927,8 @@ float4 DetectComplexShapes(uint2 coord, float4 edges, float4 edgesLeft, float4 e
 
 void LongEdgeVS(in uint id : SV_VertexID, out float4 position : SV_Position, out float2 texcoord : TEXCOORD0, out float4 data : TANGENT0)
 {
-#if COMPUTE
-	uint packedCoord = asuint(tex2Dfetch(sZShapeCoords, uint2((id / 2) % BUFFER_WIDTH, (id / 2) / BUFFER_WIDTH))).x;
-	uint2 coord = uint2((packedCoord >> 16), (packedCoord & 0xFFFF));
-#else
-	uint2 coord = uint2((id / 2) % BUFFER_WIDTH, (id / 2) / BUFFER_WIDTH);
-#endif
 #if CMAA2_PERFORMANCE_HACK
-	coord = uint2((id / 2) % (BUFFER_WIDTH / 2), (id / 2) / (BUFFER_WIDTH / 2)) * 2;
+	uint2  coord = uint2((id / 2) % (BUFFER_WIDTH / 2), (id / 2) / (BUFFER_WIDTH / 2)) * 2;
 	float4 sampA = tex2Dfetch(sZShapes, coord + int2(0, 0));
 	float4 sampB = tex2Dfetch(sZShapes, coord + int2(1, 0));
 	float4 sampC = tex2Dfetch(sZShapes, coord + int2(0, 1));
@@ -1002,6 +949,12 @@ void LongEdgeVS(in uint id : SV_VertexID, out float4 position : SV_Position, out
 	         (sampB.z == q) ? int2(1, 0) :
 	         (sampC.z == q) ? int2(0, 1) : int2(1, 1);
 #else
+#if COMPUTE
+	uint packedCoord = asuint(tex2Dfetch(sZShapeCoords, uint2((id / 2) % BUFFER_WIDTH, (id / 2) / BUFFER_WIDTH))).x;
+	uint2 coord = uint2((packedCoord >> 16), (packedCoord & 0xFFFF));
+#else
+	uint2 coord = uint2((id / 2) % BUFFER_WIDTH, (id / 2) / BUFFER_WIDTH);
+#endif
 	data = tex2Dfetch(sZShapes, coord);
 #endif
 
@@ -1065,6 +1018,8 @@ void LongEdgePS(float4 position : SV_Position, float2 texcoord : TEXCOORD0, floa
 	lerpK *= dampenEffect;
 
 	output.rgb = tex2D(sBackBuffer, (position.xy + CENTER_OFFSET + blendDir * float(srcOffset).xx * lerpK) * float2(BUFFER_RCP_WIDTH, BUFFER_RCP_HEIGHT)).rgb;
+	// in the original algorithm simpleShape are multiply by 0.8 and complexShape by 1.8
+	// to keep the same ratio we multiply output by 2.25 ( 1.8 / 0.8 )
 	output = output * 2.25;
 }
 
@@ -1108,7 +1063,11 @@ technique CMAA_2 < ui_tooltip = "A port of Intel's CMAA 2.0 (Conservative Morpho
 	{
 		VertexShader = PostProcessVS;
 		PixelShader = EdgesPS;
+#if CMAA_PACK_SINGLE_SAMPLE_EDGE_TO_HALF_WIDTH
+		RenderTarget0 = HalfWidthEdges;
+#else
 		RenderTarget0 = Edges;
+#endif
 	}
 #if !COMPUTE
 	pass
@@ -1221,7 +1180,7 @@ technique CMAA_2 < ui_tooltip = "A port of Intel's CMAA 2.0 (Conservative Morpho
 
 texture2D ZShapeScores <pooled = true;>{Width = 256; Height = 256; Format = RGBA8;};
 sampler2D sZShapeScores {Texture = ZShapeScores;};
-texture2D SimpleShapeBlendVal <pooled = true;>{Width = 4096; Height = 256; Format = RGBA8;};
+texture2D SimpleShapeBlendVal <pooled = true;>{Width = 256; Height = 256; Format = RGBA8;};
 sampler2D sSimpleShapeBlendVal {Texture = SimpleShapeBlendVal;};
 
 void SimpleShapeBlendValPS(float4 position : SV_Position, float2 texcoord : TEXCOORD, out float4 output : SV_TARGET0)
